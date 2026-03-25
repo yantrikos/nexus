@@ -33,6 +33,19 @@ DEFAULT_RETRY_DELAY_MS = 1000
 DEFAULT_BATCH_SIZE = 1000
 MAX_DLQ_ATTEMPTS = 10
 MAX_PAYLOAD_BYTES = 1_048_576  # 1MB default max payload size
+VALID_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z0-9._\-:*]+$")
+MAX_IDENTIFIER_LENGTH = 256
+
+
+def _validate_identifier(value: str, name: str):
+    """Validate identifiers to prevent injection. Only allows safe characters."""
+    if not value or len(value) > MAX_IDENTIFIER_LENGTH:
+        raise ValidationError(f"{name} must be 1-{MAX_IDENTIFIER_LENGTH} characters")
+    if not VALID_IDENTIFIER_PATTERN.match(value):
+        raise ValidationError(
+            f"{name} contains invalid characters. Allowed: a-z, A-Z, 0-9, . _ - : *",
+            {"value": value, "field": name},
+        )
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
@@ -330,6 +343,13 @@ class NexusEngine:
         headers: Arbitrary key-value headers for routing/metadata.
         tags: Arbitrary key-value tags for filtering.
         """
+        # Input validation
+        _validate_identifier(event_type, "event_type")
+        _validate_identifier(source, "source")
+        _validate_identifier(partition_key, "partition_key")
+        if idempotency_key is not None:
+            _validate_identifier(idempotency_key, "idempotency_key")
+
         event_id = _generate_event_id()
         now = _now()
 
@@ -497,6 +517,7 @@ class NexusEngine:
 
     def create_consumer_group(self, group_id: str, description: str = "") -> str:
         """Create a consumer group. Returns the group_id."""
+        _validate_identifier(group_id, "group_id")
         now = _now()
         with self._lock:
             with self._get_cursor() as cur:

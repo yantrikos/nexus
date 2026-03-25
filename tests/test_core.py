@@ -547,6 +547,33 @@ class TestEnhancedStats(NexusTestCase):
         self.assertGreater(stats["total_bytes"], 0)
 
 
+class TestInputValidation(NexusTestCase):
+
+    def test_reject_sql_injection_in_event_type(self):
+        from nexus_engine.core import ValidationError
+        with self.assertRaises(ValidationError):
+            self.engine.publish("'; DROP TABLE events;--", {}, "s")
+
+    def test_reject_special_chars_in_source(self):
+        from nexus_engine.core import ValidationError
+        with self.assertRaises(ValidationError):
+            self.engine.publish("test", {}, "source with spaces")
+
+    def test_reject_special_chars_in_group_id(self):
+        from nexus_engine.core import ValidationError
+        with self.assertRaises(ValidationError):
+            self.engine.create_consumer_group("group; DROP TABLE")
+
+    def test_valid_identifiers_accepted(self):
+        e = self.engine.publish("session.start", {}, "gateway-v2", partition_key="agent:default")
+        self.assertTrue(e.event_id)
+
+    def test_reject_empty_event_type(self):
+        from nexus_engine.core import ValidationError
+        with self.assertRaises(ValidationError):
+            self.engine.publish("", {}, "s")
+
+
 class TestExceptions(NexusTestCase):
 
     def test_nexus_error_has_code(self):
