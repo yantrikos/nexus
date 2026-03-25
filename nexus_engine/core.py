@@ -32,6 +32,50 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_MS = 1000
 DEFAULT_BATCH_SIZE = 1000
 MAX_DLQ_ATTEMPTS = 10
+MAX_PAYLOAD_BYTES = 1_048_576  # 1MB default max payload size
+
+
+# ── Exceptions ─────────────────────────────────────────────────────────────
+
+class NexusError(Exception):
+    """Base exception for all Nexus errors."""
+    code: str = "NEXUS_ERROR"
+    retryable: bool = False
+
+    def __init__(self, message: str, details: Optional[dict] = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+class ValidationError(NexusError):
+    code = "NEXUS_VALIDATION_ERROR"
+
+
+class SchemaValidationError(ValidationError):
+    code = "NEXUS_SCHEMA_MISMATCH"
+
+
+class PayloadTooLargeError(ValidationError):
+    code = "NEXUS_PAYLOAD_TOO_LARGE"
+
+
+class DuplicateEventError(NexusError):
+    code = "NEXUS_DUPLICATE_EVENT"
+
+    def __init__(self, message: str, existing_event_id: str = "", existing_sequence: int = 0):
+        super().__init__(message)
+        self.existing_event_id = existing_event_id
+        self.existing_sequence = existing_sequence
+
+
+class StorageError(NexusError):
+    code = "NEXUS_STORAGE_ERROR"
+    retryable = True
+
+
+class CorruptionError(StorageError):
+    code = "NEXUS_CORRUPTION"
+    retryable = False
 
 
 # ── Data Classes ───────────────────────────────────────────────────────────
@@ -47,8 +91,14 @@ class Event:
     correlation_id: Optional[str] = None
     causation_id: Optional[str] = None
     metadata: Optional[dict] = None
+    headers: Optional[dict] = None
+    tags: Optional[dict] = None
     created_at: str = ""
     partition_key: str = DEFAULT_PARTITION
+    size_bytes: int = 0
+    idempotency_key: Optional[str] = None
+    expires_at: Optional[str] = None
+    deduplicated: bool = False
 
 
 @dataclass
@@ -133,17 +183,23 @@ class NexusEngine:
         with self._get_cursor() as cur:
             cur.executescript("""
                 CREATE TABLE IF NOT EXISTS events (
-                    sequence_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id       TEXT    NOT NULL UNIQUE,
-                    event_type     TEXT    NOT NULL,
-                    source         TEXT    NOT NULL,
-                    payload        TEXT    NOT NULL,
-                    schema_version TEXT    NOT NULL DEFAULT '1.0',
-                    correlation_id TEXT,
-                    causation_id   TEXT,
-                    metadata       TEXT,
-                    created_at     TEXT    NOT NULL,
-                    partition_key  TEXT    NOT NULL DEFAULT 'default'
+                    sequence_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id         TEXT    NOT NULL UNIQUE,
+                    event_type       TEXT    NOT NULL,
+                    source           TEXT    NOT NULL,
+                    payload          TEXT    NOT NULL,
+                    schema_version   TEXT    NOT NULL DEFAULT '1.0',
+                    correlation_id   TEXT,
+                    causation_id     TEXT,
+                    metadata         TEXT,
+                    headers          TEXT,
+                    tags             TEXT,
+                    created_at       TEXT    NOT NULL,
+                    partition_key    TEXT    NOT NULL DEFAULT 'default',
+                    size_bytes       INTEGER NOT NULL DEFAULT 0,
+                    idempotency_key  TEXT,
+                    expires_at       TEXT,
+                    checksum         TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_events_type
@@ -156,6 +212,11 @@ class NexusEngine:
                     ON events(correlation_id);
                 CREATE INDEX IF NOT EXISTS idx_events_partition_seq
                     ON events(partition_key, sequence_id);
+                CREATE INDEX IF NOT EXISTS idx_events_expires
+                    ON events(expires_at) WHERE expires_at IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe
+                    ON events(partition_key, source, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS consumer_groups (
                     group_id    TEXT PRIMARY KEY,
@@ -252,35 +313,102 @@ class NexusEngine:
         correlation_id: Optional[str] = None,
         causation_id: Optional[str] = None,
         metadata: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        tags: Optional[dict] = None,
         partition_key: str = DEFAULT_PARTITION,
         schema_version: str = "1.0",
+        idempotency_key: Optional[str] = None,
+        ttl_seconds: Optional[int] = None,
     ) -> Event:
-        """Publish a single event to the log. Returns the stored Event."""
+        """
+        Publish a single event to the log. Returns the stored Event.
+
+        idempotency_key: If set, duplicate publishes with the same
+            (partition, source, idempotency_key) return the existing event
+            instead of creating a duplicate.
+        ttl_seconds: If set, event expires after this many seconds.
+        headers: Arbitrary key-value headers for routing/metadata.
+        tags: Arbitrary key-value tags for filtering.
+        """
         event_id = _generate_event_id()
         now = _now()
 
-        # Optional schema validation
+        # Validate schema if strict mode
         if self.config.get("strict_schemas", False):
             self._validate_schema(event_type, payload)
 
+        # Serialize and check payload size
+        payload_json = json.dumps(payload)
+        size_bytes = len(payload_json.encode("utf-8"))
+        max_size = self.config.get("max_payload_bytes", MAX_PAYLOAD_BYTES)
+        if size_bytes > max_size:
+            raise PayloadTooLargeError(
+                f"Payload size {size_bytes} exceeds limit {max_size}",
+                {"size_bytes": size_bytes, "max_bytes": max_size},
+            )
+
+        # Compute checksum
+        checksum = hashlib.sha256(payload_json.encode()).hexdigest()[:16]
+
+        # Compute expiry
+        expires_at = None
+        if ttl_seconds:
+            expires_at = _now_plus_seconds(ttl_seconds)
+
         with self._lock:
             with self._get_cursor() as cur:
+                # Idempotent publish: check for existing event
+                if idempotency_key is not None:
+                    cur.execute(
+                        """SELECT sequence_id, event_id, created_at FROM events
+                           WHERE partition_key = ? AND source = ? AND idempotency_key = ?""",
+                        (partition_key, source, idempotency_key),
+                    )
+                    existing = cur.fetchone()
+                    if existing:
+                        return Event(
+                            sequence_id=existing["sequence_id"],
+                            event_id=existing["event_id"],
+                            event_type=event_type,
+                            source=source,
+                            payload=payload,
+                            schema_version=schema_version,
+                            correlation_id=correlation_id,
+                            causation_id=causation_id,
+                            metadata=metadata,
+                            headers=headers,
+                            tags=tags,
+                            created_at=existing["created_at"],
+                            partition_key=partition_key,
+                            size_bytes=size_bytes,
+                            idempotency_key=idempotency_key,
+                            deduplicated=True,
+                        )
+
                 cur.execute(
                     """INSERT INTO events
                        (event_id, event_type, source, payload, schema_version,
-                        correlation_id, causation_id, metadata, created_at, partition_key)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        correlation_id, causation_id, metadata, headers, tags,
+                        created_at, partition_key, size_bytes, idempotency_key,
+                        expires_at, checksum)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         event_id,
                         event_type,
                         source,
-                        json.dumps(payload),
+                        payload_json,
                         schema_version,
                         correlation_id,
                         causation_id,
                         json.dumps(metadata) if metadata else None,
+                        json.dumps(headers) if headers else None,
+                        json.dumps(tags) if tags else None,
                         now,
                         partition_key,
+                        size_bytes,
+                        idempotency_key,
+                        expires_at,
+                        checksum,
                     ),
                 )
                 sequence_id = cur.lastrowid
@@ -295,8 +423,13 @@ class NexusEngine:
             correlation_id=correlation_id,
             causation_id=causation_id,
             metadata=metadata,
+            headers=headers,
+            tags=tags,
             created_at=now,
             partition_key=partition_key,
+            size_bytes=size_bytes,
+            idempotency_key=idempotency_key,
+            expires_at=expires_at,
         )
 
     def publish_batch(self, events: list[dict]) -> list[Event]:
@@ -913,9 +1046,21 @@ class NexusEngine:
         )
         source_dist = {row["source"]: row["count"] for row in cur.fetchall()}
 
+        # DB and WAL file sizes
+        db_size = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
+        wal_path = self._db_path + "-wal"
+        wal_size = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+
+        # Total payload bytes
+        cur.execute("SELECT COALESCE(SUM(size_bytes), 0) as total FROM events")
+        total_bytes = cur.fetchone()["total"]
+
         return {
             "total_events": total_events,
             "head_sequence": head_sequence,
+            "total_bytes": total_bytes,
+            "db_size_bytes": db_size,
+            "wal_size_bytes": wal_size,
             "consumer_groups": total_groups,
             "active_subscriptions": total_subs,
             "dlq_depth": dlq_depth,
@@ -988,6 +1133,42 @@ class NexusEngine:
             lines.append(json.dumps(asdict(event)))
         return "\n".join(lines)
 
+    # ── TTL / Expiry ──────────────────────────────────────────────────
+
+    def expire_events(self) -> int:
+        """Delete events that have passed their TTL. Returns count deleted."""
+        now = _now()
+        with self._lock:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    "DELETE FROM events WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (now,),
+                )
+                return cur.rowcount
+
+    # ── Snapshot / Backup ──────────────────────────────────────────────
+
+    def create_snapshot(self, target_path: str) -> dict:
+        """Create a consistent backup using SQLite backup API."""
+        import sqlite3 as _sqlite3
+        try:
+            dst = _sqlite3.connect(target_path)
+            self._conn.backup(dst)
+            dst.close()
+            size = os.path.getsize(target_path)
+            return {"success": True, "path": target_path, "size_bytes": size}
+        except Exception as e:
+            raise StorageError(f"Snapshot failed: {e}")
+
+    def verify_integrity(self) -> dict:
+        """Run SQLite integrity check."""
+        cur = self._conn.cursor()
+        cur.execute("PRAGMA integrity_check")
+        result = cur.fetchone()[0]
+        if result != "ok":
+            raise CorruptionError(f"Integrity check failed: {result}")
+        return {"integrity": "ok"}
+
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     def close(self):
@@ -1005,6 +1186,8 @@ class NexusEngine:
         """Convert a SQLite row to an Event."""
         payload = row["payload"]
         metadata = row["metadata"]
+        headers = row["headers"] if "headers" in row.keys() else None
+        tags = row["tags"] if "tags" in row.keys() else None
         return Event(
             sequence_id=row["sequence_id"],
             event_id=row["event_id"],
@@ -1015,8 +1198,13 @@ class NexusEngine:
             correlation_id=row["correlation_id"],
             causation_id=row["causation_id"],
             metadata=json.loads(metadata) if metadata else None,
+            headers=json.loads(headers) if headers else None,
+            tags=json.loads(tags) if tags else None,
             created_at=row["created_at"],
             partition_key=row["partition_key"],
+            size_bytes=row["size_bytes"] if "size_bytes" in row.keys() else 0,
+            idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
+            expires_at=row["expires_at"] if "expires_at" in row.keys() else None,
         )
 
     def __enter__(self):
@@ -1031,6 +1219,12 @@ class NexusEngine:
 def _now() -> str:
     """ISO 8601 timestamp with milliseconds."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}"
+
+
+def _now_plus_seconds(seconds: int) -> str:
+    """ISO 8601 timestamp offset by N seconds."""
+    t = time.time() + seconds
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + f".{int(t * 1000) % 1000:03d}"
 
 
 def _generate_event_id() -> str:

@@ -434,5 +434,128 @@ class TestPartitions(NexusTestCase):
         self.assertEqual(events_a[0].payload["p"], "a")
 
 
+class TestIdempotentPublish(NexusTestCase):
+
+    def test_idempotent_publish_deduplicates(self):
+        e1 = self.engine.publish("test", {"v": 1}, "s", idempotency_key="key-1")
+        e2 = self.engine.publish("test", {"v": 1}, "s", idempotency_key="key-1")
+        self.assertEqual(e1.event_id, e2.event_id)
+        self.assertEqual(e1.sequence_id, e2.sequence_id)
+        self.assertTrue(e2.deduplicated)
+        self.assertFalse(e1.deduplicated)
+
+    def test_different_keys_not_deduplicated(self):
+        e1 = self.engine.publish("test", {}, "s", idempotency_key="key-a")
+        e2 = self.engine.publish("test", {}, "s", idempotency_key="key-b")
+        self.assertNotEqual(e1.event_id, e2.event_id)
+
+    def test_same_key_different_source(self):
+        e1 = self.engine.publish("test", {}, "s1", idempotency_key="key-1")
+        e2 = self.engine.publish("test", {}, "s2", idempotency_key="key-1")
+        self.assertNotEqual(e1.event_id, e2.event_id)
+
+    def test_no_key_no_dedupe(self):
+        e1 = self.engine.publish("test", {}, "s")
+        e2 = self.engine.publish("test", {}, "s")
+        self.assertNotEqual(e1.event_id, e2.event_id)
+
+
+class TestTTLExpiry(NexusTestCase):
+
+    def test_event_has_expires_at(self):
+        e = self.engine.publish("test", {}, "s", ttl_seconds=60)
+        self.assertIsNotNone(e.expires_at)
+
+    def test_expire_events_removes_expired(self):
+        # Publish with 0 TTL (already expired)
+        self.engine.publish("test", {}, "s", ttl_seconds=-1)
+        self.engine.publish("test", {}, "s")  # no TTL
+
+        removed = self.engine.expire_events()
+        self.assertEqual(removed, 1)
+
+        stats = self.engine.stats()
+        self.assertEqual(stats["total_events"], 1)
+
+
+class TestPayloadLimits(NexusTestCase):
+
+    def test_payload_too_large(self):
+        from nexus_engine.core import PayloadTooLargeError
+        big_payload = {"data": "x" * 2_000_000}
+        with self.assertRaises(PayloadTooLargeError):
+            self.engine.publish("test", big_payload, "s")
+
+    def test_normal_payload_ok(self):
+        e = self.engine.publish("test", {"key": "value"}, "s")
+        self.assertGreater(e.size_bytes, 0)
+
+
+class TestHeadersAndTags(NexusTestCase):
+
+    def test_headers_stored(self):
+        e = self.engine.publish(
+            "test", {}, "s",
+            headers={"trace-id": "abc123", "priority": "high"},
+        )
+        # Replay and check
+        events = list(self.engine.replay())
+        self.assertEqual(events[0].headers["trace-id"], "abc123")
+
+    def test_tags_stored(self):
+        e = self.engine.publish(
+            "test", {}, "s",
+            tags={"env": "production", "region": "us-east"},
+        )
+        events = list(self.engine.replay())
+        self.assertEqual(events[0].tags["env"], "production")
+
+
+class TestSnapshot(NexusTestCase):
+
+    def test_create_snapshot(self):
+        self.engine.publish("test", {"i": 1}, "s")
+        self.engine.publish("test", {"i": 2}, "s")
+
+        snap_path = self.db_path + ".snapshot"
+        result = self.engine.create_snapshot(snap_path)
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.exists(snap_path))
+        self.assertGreater(result["size_bytes"], 0)
+
+        # Verify snapshot has the data
+        from nexus_engine.core import NexusEngine
+        snap_engine = NexusEngine({"db_path": snap_path})
+        stats = snap_engine.stats()
+        self.assertEqual(stats["total_events"], 2)
+        snap_engine.close()
+        os.unlink(snap_path)
+
+    def test_verify_integrity(self):
+        result = self.engine.verify_integrity()
+        self.assertEqual(result["integrity"], "ok")
+
+
+class TestEnhancedStats(NexusTestCase):
+
+    def test_stats_has_sizes(self):
+        self.engine.publish("test", {"data": "hello"}, "s")
+        stats = self.engine.stats()
+        self.assertIn("db_size_bytes", stats)
+        self.assertIn("wal_size_bytes", stats)
+        self.assertIn("total_bytes", stats)
+        self.assertGreater(stats["total_bytes"], 0)
+
+
+class TestExceptions(NexusTestCase):
+
+    def test_nexus_error_has_code(self):
+        from nexus_engine.core import NexusError, PayloadTooLargeError
+        e = PayloadTooLargeError("too big", {"size": 999})
+        self.assertEqual(e.code, "NEXUS_PAYLOAD_TOO_LARGE")
+        self.assertFalse(e.retryable)
+        self.assertEqual(e.details["size"], 999)
+
+
 if __name__ == "__main__":
     unittest.main()
