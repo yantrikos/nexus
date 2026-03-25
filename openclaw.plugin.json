@@ -1,0 +1,27 @@
+{
+  "id": "nexus",
+  "name": "Nexus",
+  "version": "0.1.0",
+  "description": "Durable event bus and replay log for OpenClaw plugins — append-only log, consumer groups with checkpoints, dead-letter queue, schema registry, and event replay.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dbPath": {
+        "type": "string",
+        "default": "./nexus_events.db",
+        "description": "Path to the SQLite event log database."
+      },
+      "strictSchemas": {
+        "type": "boolean",
+        "default": false,
+        "description": "Reject events that don't match registered schemas."
+      },
+      "defaultPartition": {
+        "type": "string",
+        "default": "default",
+        "description": "Default partition key for events."
+      }
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "name": "nexus",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Durable event bus and replay log for OpenClaw — append-only log, consumer groups, dead-letter queue, schema registry",
+  "author": "Yantrikos",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "nexus_engine",
+    "hooks",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yantrikos/nexus.git"
+  },
+  "homepage": "https://github.com/yantrikos/nexus#readme",
+  "bugs": {
+    "url": "https://github.com/yantrikos/nexus/issues"
+  },
+  "keywords": [
+    "openclaw", "plugin", "event-bus", "event-streaming", "replay",
+    "consumer-groups", "dead-letter-queue", "durable"
+  ],
+  "openclaw": {
+    "id": "nexus",
+    "build": {
+      "openclawVersion": "2026.3.23",
+      "pluginSdkVersion": "2026.3.23"
+    },
+    "compat": {
+      "pluginApi": ">=1.0.0",
+      "builtWithOpenClawVersion": "2026.3.23",
+      "pluginSdkVersion": "2026.3.23",
+      "minGatewayVersion": "2026.3.23"
+    },
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outdir=dist --external:@openclaw/*",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}
